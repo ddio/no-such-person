@@ -31,9 +31,26 @@
   #stage { position:relative; border:1px dashed var(--line); border-radius:10px; min-height:280px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
   #stage.drag { border-color:var(--accent); }
   #stage .hint { color:var(--dim); text-align:center; padding:40px 16px; }
-  canvas { display:none; max-width:100%; height:auto; cursor:crosshair; touch-action:none; }
+  #frame { display:none; grid-template-columns:minmax(0,1fr); max-width:100%; }
+  #frame > * { grid-area:1/1; }
+  canvas { display:block; max-width:100%; height:auto; cursor:crosshair; touch-action:none; }
   #stage.loaded { border-style:solid; }
-  #stage.loaded canvas { display:block; }
+  #stage.loaded #frame { display:grid; }
+  /* loading veil: darkness lifts with progress (--p: 0..1); shimmer + bar animate on the compositor,
+     so they stay smooth while detection keeps the main thread busy */
+  #veil { position:relative; overflow:hidden; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px;
+          background:rgba(8,8,8,calc(.92 - .84 * var(--p,0))); transition:background .25s linear; color:var(--fg); font-size:14px; }
+  #veil[hidden] { display:none; }
+  #veil::before { content:""; position:absolute; inset:0; transform:translateX(-100%);
+                  background:linear-gradient(100deg, transparent 35%, rgba(255,255,255,.10) 50%, transparent 65%);
+                  animation:sweep 1.5s linear infinite; }
+  @keyframes sweep { to { transform:translateX(100%); } }
+  #veil .label { position:relative; text-shadow:0 1px 4px #000; font-variant-numeric:tabular-nums; }
+  #veil .track { position:relative; width:min(60%,320px); height:6px; border-radius:3px; background:rgba(255,255,255,.18); overflow:hidden; }
+  #veil .fill { height:100%; border-radius:3px; background:var(--accent); transform-origin:left; transform:scaleX(var(--p,0)); transition:transform .25s linear; }
+  #veil.indeterminate .fill { width:35%; transform:none; transition:none; animation:slide 1.1s ease-in-out infinite alternate; }
+  @keyframes slide { from { margin-left:0; } to { margin-left:65%; } }
+  @media (prefers-reduced-motion: reduce) { #veil::before { animation:none; } }
   #stage.loaded .hint { display:none; }
   footer { color:var(--dim); font-size:12px; margin-top:12px; }
 </style>
@@ -59,7 +76,10 @@
   <div id="status">載入模型中…</div>
   <div id="stage">
     <div class="hint">把照片拖進來、直接貼上（Ctrl+V），或按「選擇照片」</div>
-    <canvas id="view"></canvas>
+    <div id="frame">
+      <canvas id="view"></canvas>
+      <div id="veil" hidden><span class="label"></span><div class="track"><div class="fill"></div></div></div>
+    </div>
   </div>
   <footer>
     點一下墨鏡可移除；勾選「顯示候選框」後點紅框可補戴；在漏掉的臉上從一隻眼睛拖曳到另一隻眼睛可手動加上墨鏡。匯出的圖檔會重新編碼，不含原圖的 EXIF／GPS 資訊。<br>
@@ -90,10 +110,18 @@ let glasses = [];               // see "glasses model" below
 let rawBoxes = [];
 let busy = false;
 let runId = 0;                  // bumping it cancels the detection in flight
-let progress = 0;               // 0..1 while busy, drives the veil
 let fileName = "photo";
 
 const setStatus = (html) => { statusEl.innerHTML = html; };
+const veil = $("veil");
+// p = null -> indeterminate (model download), otherwise 0..1
+function setVeil(p, text) {
+  veil.hidden = false;
+  veil.classList.toggle("indeterminate", p === null);
+  veil.style.setProperty("--p", p ?? 0);
+  veil.querySelector(".label").textContent = text;
+  setStatus(text);
+}
 // MessageChannel instead of setTimeout/rAF: those are throttled to ~1/s in background tabs
 const yieldToUI = () => new Promise((r) => { const ch = new MessageChannel(); ch.port1.onmessage = r; ch.port2.postMessage(0); });
 
@@ -188,7 +216,7 @@ const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 // therefore template x jitter x a coarse face scale — it cannot be inverted
 // back to eye spacing or eye width, and re-running gives a different result.
 const rand = () => crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32;
-const BASE = { tw: 1.0, th: 0.86, gap: 0.16, drop: 0.07 };   // in units of face scale (~ eye-to-eye distance)
+const BASE = { tw: 0.9, th: 0.76, gap: 0.16, drop: 0.06 };   // in units of face scale (~ eye-to-eye distance)
 let template = null;
 
 function fitTemplate() {
@@ -196,8 +224,9 @@ function fitTemplate() {
   const up = Math.max(0, ...glasses.map((g) => g.need?.up || 0));
   const k = 1 + rand() * 0.08;
   template = {
-    tw: Math.max(BASE.tw, span - BASE.gap / 2) * k,
-    th: Math.max(BASE.th, 2 * (up + BASE.drop)) * k,
+    // needs may grow the model by at most 20%, so one odd face cannot balloon everyone's glasses
+    tw: Math.min(BASE.tw * 1.2, Math.max(BASE.tw, span - BASE.gap / 2)) * k,
+    th: Math.min(BASE.th * 1.2, Math.max(BASE.th, 2 * (up + BASE.drop))) * k,
     gap: BASE.gap, drop: BASE.drop,
   };
 }
@@ -240,10 +269,11 @@ function refine(box) {
   const upOf = (p) => (p.x - c.x) * Math.sin(ang) - (p.y - c.y) * Math.cos(ang);
   return {
     c, ang, s: scale, fx, temples: [P(lm, 127), P(lm, 356)], j: jitter(), kind: "mesh", box,
-    // what this face needs from the shared template: reach past the outer eye corners, and above the brows
-    need: {
-      span: Math.max(dist(c, P(lm, 33)), dist(c, P(lm, 263))) / (scale * fx) + 0.3,
-      up: Math.max(upOf(P(lm, 105)), upOf(P(lm, 334))) / scale + 0.08,
+    // what this face needs from the shared template: reach just past the outer eye corners, and over most of the brows
+    // (strongly turned heads are skipped: their far-side landmarks are guesses)
+    need: fx < 0.8 ? null : {
+      span: Math.max(dist(c, P(lm, 33)), dist(c, P(lm, 263))) / (scale * fx) + 0.08,
+      up: Math.max(upOf(P(lm, 105)), upOf(P(lm, 334))) / scale * 0.75,
     },
   };
 }
@@ -251,13 +281,15 @@ function refine(box) {
 async function run() {
   if (!source) return;
   const id = ++runId;
-  busy = true; progress = 0; glasses = []; rawBoxes = [];
+  busy = true; glasses = []; rawBoxes = [];
   updateButtons(); render();
-  await ready;
+  setVeil(null, "載入模型中…");
+  try { await ready; } catch { busy = false; veil.hidden = true; return; }   // ready already reported the error
   if (id !== runId) return;
+  setVeil(0, "偵測人臉中 0%");
   const t0 = performance.now();
   const minTile = +document.querySelector("[name=depth]:checked").value;
-  const boxes = await detectBoxes(minTile, id, (p) => { progress = p; setStatus(`偵測人臉中… ${Math.round(p * 100)}%`); render(); });
+  const boxes = await detectBoxes(minTile, id, (p) => setVeil(p, `偵測人臉中 ${Math.round(p * 100)}%`));
   if (!boxes) return;
   rawBoxes = boxes;
   for (const box of rawBoxes) {
@@ -267,10 +299,10 @@ async function run() {
   }
   fitTemplate();
   const ms = Math.round(performance.now() - t0);
-  busy = false; updateButtons(); render();
+  busy = false; updateButtons(); render(); veil.hidden = true;
   const fb = glasses.filter((g) => g.kind === "eyes").length;
   setStatus(`找到 <b>${glasses.length}</b> 張臉${fb ? `（其中 ${fb} 張為粗略定位）` : ""}，耗時 ${(ms / 1000).toFixed(1)} 秒。有漏掉的請手動拖曳補上。`);
-  window.__result = {
+  window.__result = { template, 
     faces: glasses.length, fallback: fb, candidates: rawBoxes.length, ms,
     boxes: rawBoxes.map((b) => ({ x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.w), score: +b.score.toFixed(2), kind: glasses.find((g) => g.box === b)?.kind || "dropped" })),
   };
@@ -341,11 +373,6 @@ function paint(ctx, debug) {
 function render(drag) {
   if (!source) return;
   paint(vctx, !busy && $("debug").checked);
-  if (busy) {
-    // veil lifts as detection progresses: nearly black -> nearly clear
-    vctx.fillStyle = `rgba(0,0,0,${0.92 - 0.84 * progress})`;
-    vctx.fillRect(0, 0, view.width, view.height);
-  }
   if (drag) {
     vctx.strokeStyle = "#ffd23f"; vctx.lineWidth = Math.max(2, source.width / 500);
     vctx.beginPath(); vctx.moveTo(drag.a.x, drag.a.y); vctx.lineTo(drag.b.x, drag.b.y); vctx.stroke();
