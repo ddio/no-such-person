@@ -56,6 +56,8 @@
   @media (prefers-reduced-motion: reduce) { #veil::before { animation:none; } }
   #stage.loaded .hint { display:none; }
   footer { color:var(--dim); font-size:12px; margin-top:12px; }
+  footer a { color:var(--fg); }
+  footer a:hover { color:var(--accent); }
 </style>
 </head>
 <body>
@@ -86,7 +88,10 @@
   </div>
   <footer>
     點一下墨鏡可移除；勾選「顯示候選框」後點紅框可補戴；在漏掉的臉上從一隻眼睛拖曳到另一隻眼睛可手動加上墨鏡。匯出的圖檔會重新編碼，不含原圖的 EXIF／GPS 資訊。<br>
-    模型與程式全部由本站提供，頁面以 CSP 禁止任何對外連線——可以打開開發者工具的 Network 分頁，或直接離線使用來驗證。
+    模型與程式全部由本站提供，頁面以 CSP 禁止任何對外連線——可以打開開發者工具的 Network 分頁，或直接離線使用來驗證。<br>
+    <a href="https://github.com/ddio/no-such-person" target="_blank" rel="noopener">GitHub 原始碼</a> ·
+    <a href="https://github.com/ddio/no-such-person/issues" target="_blank" rel="noopener">回報問題／許願</a> ·
+    MIT License
   </footer>
 </main>
 
