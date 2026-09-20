@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>查無此人 — 自動墨鏡 prototype</title>
+<style>
+  :root { color-scheme: dark; --bg:#111; --panel:#1b1b1b; --line:#333; --fg:#eee; --dim:#999; --accent:#ffd23f; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 system-ui, "Noto Sans TC", sans-serif; }
+  header { padding:20px 16px 8px; max-width:1100px; margin:0 auto; }
+  h1 { margin:0; font-size:22px; letter-spacing:.05em; }
+  h1 small { font-size:13px; color:var(--dim); font-weight:normal; margin-left:8px; }
+  header p { margin:4px 0 0; color:var(--dim); font-size:13px; }
+  main { max-width:1100px; margin:0 auto; padding:8px 16px 40px; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; padding:10px 12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; }
+  button, select, .filebtn { font:inherit; color:var(--fg); background:#2a2a2a; border:1px solid #444; border-radius:8px; padding:6px 14px; cursor:pointer; }
+  button:hover:not(:disabled), .filebtn:hover { border-color:var(--accent); }
+  button:disabled { opacity:.4; cursor:default; }
+  .filebtn { background:var(--accent); color:#111; border-color:var(--accent); font-weight:600; }
+  .filebtn input { display:none; }
+  label.opt { color:var(--dim); font-size:13px; display:flex; align-items:center; gap:4px; }
+  #status { margin:10px 2px; font-size:13px; color:var(--dim); min-height:1.6em; }
+  #status b { color:var(--accent); font-weight:600; }
+  #stage { position:relative; border:1px dashed var(--line); border-radius:10px; min-height:280px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+  #stage.drag { border-color:var(--accent); }
+  #stage .hint { color:var(--dim); text-align:center; padding:40px 16px; }
+  canvas { display:none; max-width:100%; height:auto; cursor:crosshair; touch-action:none; }
+  #stage.loaded { border-style:solid; }
+  #stage.loaded canvas { display:block; }
+  #stage.loaded .hint { display:none; }
+  footer { color:var(--dim); font-size:12px; margin-top:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>查無此人<small>no-such-person · prototype</small></h1>
+  <p>自動找出照片裡的人臉並戴上墨鏡。所有運算都在你的瀏覽器裡完成，照片不會上傳。</p>
+</header>
+<main>
+  <div class="bar">
+    <label class="filebtn">選擇照片<input id="file" type="file" accept="image/*"></label>
+    <select id="depth" title="偵測精細度：越徹底越能找到小臉，但越慢">
+      <option value="256">快速</option>
+      <option value="160" selected>標準</option>
+      <option value="96">徹底（小臉）</option>
+    </select>
+    <button id="rerun" disabled>重新偵測</button>
+    <label class="opt" title="綠＝已戴墨鏡；紅＝信心不足被略過的候選，點一下可強制戴上"><input id="debug" type="checkbox">顯示候選框</label>
+    <span style="flex:1"></span>
+    <button id="savePng" disabled>下載 PNG</button>
+    <button id="saveJpg" disabled>下載 JPG</button>
+  </div>
+  <div id="status">載入模型中…</div>
+  <div id="stage">
+    <div class="hint">把照片拖進來，或按「選擇照片」</div>
+    <canvas id="view"></canvas>
+  </div>
+  <footer>
+    點一下墨鏡可移除；勾選「顯示候選框」後點紅框可補戴；在漏掉的臉上從一隻眼睛拖曳到另一隻眼睛可手動加上墨鏡。匯出的圖檔會重新編碼，不含原圖的 EXIF／GPS 資訊。<br>
+    Prototype 階段的模型與 WASM 由 CDN 載入（只下載、不上傳）；正式版會改為同站自帶。
+  </footer>
+</main>
+
+<script type="module">
+const MP = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1";
+const DETECTOR_MODEL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite";
+const LANDMARKER_MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+
+const MAX_EDGE = 4096;          // working resolution cap
+const MIN_SCORE = 0.5;          // detector confidence
+// Tuned on test-photos/: every real face scored >= 0.76, every false positive <= 0.71
+const MESH_SCORE = 0.7;         // candidates confirmed by the landmarker need at least this detector score
+const FALLBACK_SCORE = 0.75;    // detector-only faces (landmarker found nothing) need this much
+const CROP = 384;               // landmarker input crop size
+
+const q = new URLSearchParams(location.search);   // dev knobs, see bottom of file
+const $ = (id) => document.getElementById(id);
+const view = $("view"), vctx = view.getContext("2d");
+const statusEl = $("status"), stage = $("stage");
+
+let detector, landmarker;
+let source = null;              // canvas holding the original pixels
+let glasses = [];               // [{L:{x,y,w}, R:{x,y,w}, h, temples, kind, box}]
+let rawBoxes = [];
+let busy = false;
+let fileName = "photo";
+
+const setStatus = (html) => { statusEl.innerHTML = html; };
+// MessageChannel instead of setTimeout/rAF: those are throttled to ~1/s in background tabs
+const yieldToUI = () => new Promise((r) => { const ch = new MessageChannel(); ch.port1.onmessage = r; ch.port2.postMessage(0); });
+
+// ---------- model loading ----------
+async function createTasks(vision, delegate) {
+  const { FaceDetector, FaceLandmarker } = vision;
+  const fileset = await vision.FilesetResolver.forVisionTasks(`${MP}/wasm`);
+  detector = await FaceDetector.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: DETECTOR_MODEL, delegate },
+    runningMode: "IMAGE",
+    minDetectionConfidence: MIN_SCORE,
+  });
+  landmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: LANDMARKER_MODEL, delegate },
+    runningMode: "IMAGE",
+    numFaces: 3,
+    minFaceDetectionConfidence: q.get("lmc") ? +q.get("lmc") : 0.5,
+    minFacePresenceConfidence: q.get("lmc") ? +q.get("lmc") : 0.5,
+  });
+}
+
+const ready = (async () => {
+  const vision = await import(`${MP}/vision_bundle.mjs`);
+  let delegate = "GPU";
+  try { await createTasks(vision, delegate); }
+  catch (e) { console.warn("GPU delegate failed, using CPU", e); delegate = "CPU"; await createTasks(vision, delegate); }
+  setStatus(`模型已就緒（${delegate}）。請選擇照片。`);
+})().catch((e) => { console.error(e); setStatus("模型載入失敗：" + e.message); throw e; });
+
+// ---------- detection ----------
+// Square tiles at halving sizes with 50% overlap, so every face smaller than
+// half a tile sits fully inside at least one tile at a scale where it is large
+// enough for the short-range detector.
+function* tiles(w, h, minTile) {
+  yield { x: 0, y: 0, w, h };
+  for (let t = Math.max(w, h) / 2; t >= minTile; t /= 2) {
+    const tw = Math.min(t, w), th = Math.min(t, h);
+    const nx = Math.max(1, Math.ceil((w - tw) / (t / 2))), ny = Math.max(1, Math.ceil((h - th) / (t / 2)));
+    for (let j = 0; j <= ny; j++) for (let i = 0; i <= nx; i++) {
+      if ((i && w === tw) || (j && h === th)) continue;
+      yield { x: Math.round((w - tw) * i / nx), y: Math.round((h - th) * j / ny), w: Math.round(tw), h: Math.round(th) };
+    }
+  }
+}
+
+function overlap(a, b) {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const inter = ix * iy;
+  return inter / Math.min(a.w * a.h, b.w * b.h);
+}
+
+async function detectBoxes(minTile, onProgress) {
+  const all = [...tiles(source.width, source.height, minTile)];
+  const tile = document.createElement("canvas");
+  const tctx = tile.getContext("2d", { willReadFrequently: false });
+  const found = [];
+  let last = performance.now();
+  for (let n = 0; n < all.length; n++) {
+    const t = all[n];
+    tile.width = t.w; tile.height = t.h;
+    tctx.drawImage(source, t.x, t.y, t.w, t.h, 0, 0, t.w, t.h);
+    for (const d of detector.detect(tile).detections) {
+      const b = d.boundingBox, m = Math.min(t.w, t.h) * 0.02;
+      // drop faces cut off by a tile edge (unless that edge is the photo's edge)
+      if ((b.originX < m && t.x > 0) || (b.originY < m && t.y > 0) ||
+          (b.originX + b.width > t.w - m && t.x + t.w < source.width) ||
+          (b.originY + b.height > t.h - m && t.y + t.h < source.height)) continue;
+      found.push({
+        x: t.x + b.originX, y: t.y + b.originY, w: b.width, h: b.height,
+        score: d.categories[0].score,
+        eyes: d.keypoints.slice(0, 2).map((k) => ({ x: t.x + k.x * t.w, y: t.y + k.y * t.h })),
+      });
+    }
+    if (performance.now() - last > 60) { onProgress(n + 1, all.length); await yieldToUI(); last = performance.now(); }
+  }
+  found.sort((a, b) => b.score - a.score);
+  const keep = [];
+  for (const f of found) if (!keep.some((k) => overlap(k, f) > 0.4)) keep.push(f);
+  return keep;
+}
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+
+function glassesFromEyes(a, b, kind, box) {
+  const d = dist(a, b);
+  return { L: { ...a, w: d * 0.88 }, R: { ...b, w: d * 0.88 }, h: d * 0.64, drop: d * 0.06, temples: null, kind, box };
+}
+
+const cropCanvas = document.createElement("canvas");
+cropCanvas.width = cropCanvas.height = CROP;
+const cropCtx = cropCanvas.getContext("2d");
+
+function refine(box) {
+  const side = Math.max(box.w, box.h) * 2.2;
+  const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+  const ox = cx - side / 2, oy = cy - side / 2;
+  cropCtx.fillStyle = "#000"; cropCtx.fillRect(0, 0, CROP, CROP);
+  cropCtx.drawImage(source, ox, oy, side, side, 0, 0, CROP, CROP);
+  const faces = landmarker.detect(cropCanvas).faceLandmarks || [];
+  const P = (lm, i) => ({ x: ox + lm[i].x * side, y: oy + lm[i].y * side });
+  let best = null;
+  for (const lm of faces) {
+    const c = mid(mid(P(lm, 33), P(lm, 133)), mid(P(lm, 362), P(lm, 263)));
+    const off = dist(c, { x: cx, y: cy });
+    if (c.x < box.x || c.x > box.x + box.w || c.y < box.y || c.y > box.y + box.h) continue;
+    if (!best || off < best.off) best = { lm, off };
+  }
+  if (!best) return null;
+  const lm = best.lm;
+  const eL = mid(P(lm, 33), P(lm, 133)), eR = mid(P(lm, 362), P(lm, 263));
+  const d = dist(eL, eR), faceH = dist(P(lm, 10), P(lm, 152));
+  // per-eye width follows each eye's apparent size, so the far lens shrinks when the head turns
+  let wL = dist(P(lm, 33), P(lm, 133)) * 2.0, wR = dist(P(lm, 362), P(lm, 263)) * 2.0;
+  const fit = (d * 0.94) / ((wL + wR) / 2);
+  if (fit < 1) { wL *= fit; wR *= fit; }
+  return {
+    L: { ...eL, w: wL }, R: { ...eR, w: wR },
+    h: Math.max(faceH * 0.24, d * 0.5), drop: faceH * 0.035,
+    temples: [P(lm, 127), P(lm, 356)], kind: "mesh", box,
+  };
+}
+
+async function run() {
+  if (!source || busy) return;
+  busy = true; updateButtons();
+  await ready;
+  const t0 = performance.now();
+  const minTile = +$("depth").value;
+  rawBoxes = await detectBoxes(minTile, (n, total) => setStatus(`偵測人臉中… ${Math.round(n / total * 100)}%`));
+  glasses = [];
+  for (const box of rawBoxes) {
+    const g = (box.score >= MESH_SCORE && refine(box)) ||
+      (box.score >= FALLBACK_SCORE ? glassesFromEyes(box.eyes[0], box.eyes[1], "eyes", box) : null);
+    if (g) glasses.push(g);
+  }
+  const ms = Math.round(performance.now() - t0);
+  busy = false; updateButtons(); render();
+  const fb = glasses.filter((g) => g.kind === "eyes").length;
+  setStatus(`找到 <b>${glasses.length}</b> 張臉${fb ? `（其中 ${fb} 張為粗略定位）` : ""}，耗時 ${(ms / 1000).toFixed(1)} 秒。有漏掉的請手動拖曳補上。`);
+  window.__result = {
+    faces: glasses.length, fallback: fb, candidates: rawBoxes.length, ms,
+    boxes: rawBoxes.map((b) => ({ x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.w), score: +b.score.toFixed(2), kind: glasses.find((g) => g.box === b)?.kind || "dropped" })),
+  };
+}
+
+// ---------- rendering ----------
+function lensPath(ctx, w, h) {
+  ctx.beginPath();
+  ctx.roundRect(-w / 2, -h / 2, w, h, [h * 0.22, h * 0.22, h * 0.45, h * 0.45]);
+}
+
+function drawGlasses(ctx, g) {
+  const ang = Math.atan2(g.R.y - g.L.y, g.R.x - g.L.x);
+  const c = mid(g.L, g.R), d = dist(g.L, g.R), h = g.h;
+  ctx.save();
+  ctx.translate(c.x, c.y); ctx.rotate(ang); ctx.translate(0, g.drop);
+  const lx = -d / 2, rx = d / 2, frame = Math.max(1.5, h * 0.09);
+  ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#0a0a0a";
+
+  if (g.temples) {
+    // temples run from each lens' outer top corner to the side of the head
+    const inv = (p) => { const x = p.x - c.x, y = p.y - c.y, cs = Math.cos(-ang), sn = Math.sin(-ang); return { x: x * cs - y * sn, y: x * sn + y * cs - g.drop }; };
+    const tl = inv(g.temples[0]), tr = inv(g.temples[1]);
+    ctx.lineWidth = frame * 1.3;
+    ctx.beginPath();
+    if (tl.x < lx - g.L.w / 2) { ctx.moveTo(lx - g.L.w / 2, -h * 0.28); ctx.lineTo(tl.x, -h * 0.2); }
+    if (tr.x > rx + g.R.w / 2) { ctx.moveTo(rx + g.R.w / 2, -h * 0.28); ctx.lineTo(tr.x, -h * 0.2); }
+    ctx.stroke();
+  }
+
+  ctx.lineWidth = frame * 1.6;
+  ctx.beginPath(); ctx.moveTo(lx + g.L.w / 2, -h * 0.26); ctx.lineTo(rx - g.R.w / 2, -h * 0.26); ctx.stroke();
+
+  for (const [x, w] of [[lx, g.L.w], [rx, g.R.w]]) {
+    ctx.save(); ctx.translate(x, 0);
+    const grad = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
+    grad.addColorStop(0, "#262626"); grad.addColorStop(1, "#000");
+    lensPath(ctx, w, h); ctx.fillStyle = grad; ctx.fill();
+    ctx.lineWidth = frame; ctx.stroke();
+    // glint — drawn over the opaque lens, so nothing underneath shows through
+    ctx.save(); lensPath(ctx, w, h); ctx.clip();
+    ctx.rotate(-0.5); ctx.fillStyle = "rgba(255,255,255,.13)";
+    ctx.fillRect(-w * 0.32, -h, w * 0.14, h * 2); ctx.fillRect(-w * 0.12, -h, w * 0.05, h * 2);
+    ctx.restore(); ctx.restore();
+  }
+  ctx.restore();
+}
+
+function paint(ctx, debug) {
+  ctx.drawImage(source, 0, 0);
+  for (const g of glasses) drawGlasses(ctx, g);
+  if (debug) {
+    ctx.lineWidth = Math.max(2, source.width / 600);
+    for (const g of glasses) if (g.box) {
+      ctx.strokeStyle = g.kind === "mesh" ? "#3f6" : "#fa3";
+      ctx.strokeRect(g.box.x, g.box.y, g.box.w, g.box.h);
+    }
+    ctx.strokeStyle = "#f44";
+    for (const b of rawBoxes) if (!glasses.some((g) => g.box === b)) ctx.strokeRect(b.x, b.y, b.w, b.h);
+  }
+}
+
+function render(drag) {
+  if (!source) return;
+  paint(vctx, $("debug").checked);
+  if (drag) {
+    vctx.strokeStyle = "#ffd23f"; vctx.lineWidth = Math.max(2, source.width / 500);
+    vctx.beginPath(); vctx.moveTo(drag.a.x, drag.a.y); vctx.lineTo(drag.b.x, drag.b.y); vctx.stroke();
+  }
+}
+
+function updateButtons() {
+  for (const id of ["rerun", "savePng", "saveJpg"]) $(id).disabled = !source || busy;
+}
+
+// ---------- input ----------
+async function loadBlob(blob, name) {
+  const bmp = await createImageBitmap(blob, { imageOrientation: "from-image" });
+  const s = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
+  source = document.createElement("canvas");
+  source.width = Math.round(bmp.width * s); source.height = Math.round(bmp.height * s);
+  source.getContext("2d").drawImage(bmp, 0, 0, source.width, source.height);
+  bmp.close();
+  view.width = source.width; view.height = source.height;
+  fileName = (name || "photo").replace(/\.[^.]+$/, "");
+  glasses = []; rawBoxes = [];
+  stage.classList.add("loaded");
+  render();
+  await run();
+}
+
+$("file").addEventListener("change", (e) => e.target.files[0] && loadBlob(e.target.files[0], e.target.files[0].name));
+$("rerun").addEventListener("click", run);
+$("debug").addEventListener("change", () => render());
+for (const ev of ["dragenter", "dragover"]) stage.addEventListener(ev, (e) => { e.preventDefault(); stage.classList.add("drag"); });
+for (const ev of ["dragleave", "drop"]) stage.addEventListener(ev, (e) => { e.preventDefault(); stage.classList.remove("drag"); });
+stage.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) loadBlob(f, f.name); });
+
+const toImage = (e) => {
+  const r = view.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * view.width / r.width, y: (e.clientY - r.top) * view.height / r.height };
+};
+function hit(p) {
+  for (let i = glasses.length - 1; i >= 0; i--) {
+    const g = glasses[i], c = mid(g.L, g.R);
+    if (dist(p, c) < dist(g.L, g.R) / 2 + Math.max(g.L.w, g.R.w) / 2) return i;
+  }
+  return -1;
+}
+let drag = null;
+view.addEventListener("pointerdown", (e) => { if (busy) return; view.setPointerCapture(e.pointerId); drag = { a: toImage(e), b: toImage(e) }; });
+view.addEventListener("pointermove", (e) => { if (drag) { drag.b = toImage(e); render(drag); } });
+view.addEventListener("pointerup", (e) => {
+  if (!drag) return;
+  const { a, b } = drag; drag = null;
+  const moved = dist(a, b) * view.getBoundingClientRect().width / view.width;
+  if (moved < 8) {
+    const i = hit(a);
+    if (i >= 0) glasses.splice(i, 1);
+    else if ($("debug").checked) {
+      // promote a skipped candidate
+      const box = rawBoxes.find((b) => !glasses.some((g) => g.box === b) && a.x >= b.x && a.x <= b.x + b.w && a.y >= b.y && a.y <= b.y + b.h);
+      if (box) glasses.push(refine(box) || glassesFromEyes(box.eyes[0], box.eyes[1], "eyes", box));
+    }
+  }
+  else { const [l, r] = a.x <= b.x ? [a, b] : [b, a]; glasses.push(glassesFromEyes(l, r, "manual", null)); }
+  render();
+  setStatus(`目前有 <b>${glasses.length}</b> 副墨鏡。`);
+});
+view.addEventListener("pointercancel", () => { drag = null; render(); });
+
+// ---------- export ----------
+function save(type, ext) {
+  const out = document.createElement("canvas");
+  out.width = source.width; out.height = source.height;
+  paint(out.getContext("2d"), false);
+  out.toBlob((blob) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = `${fileName}-sunglasses.${ext}`; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, type, 0.92);
+}
+$("savePng").addEventListener("click", () => save("image/png", "png"));
+$("saveJpg").addEventListener("click", () => save("image/jpeg", "jpg"));
+
+// dev helper: ?img=test-photos/obama.jpg[&depth=96][&debug=1]
+if (q.get("depth")) $("depth").value = q.get("depth");
+if (q.get("debug")) $("debug").checked = true;
+if (q.get("img")) fetch(q.get("img")).then((r) => r.blob()).then((b) => loadBlob(b, q.get("img").split("/").pop()));
+</script>
+</body>
+</html>
