@@ -86,7 +86,7 @@ const statusEl = $("status"), stage = $("stage");
 
 let detector, landmarker;
 let source = null;              // canvas holding the original pixels
-let glasses = [];               // [{L:{x,y,w}, R:{x,y,w}, h, temples, kind, box}]
+let glasses = [];               // see "glasses model" below
 let rawBoxes = [];
 let busy = false;
 let runId = 0;                  // bumping it cancels the detection in flight
@@ -110,6 +110,7 @@ async function createTasks(vision, delegate) {
     baseOptions: { modelAssetPath: LANDMARKER_MODEL, delegate },
     runningMode: "IMAGE",
     numFaces: 3,
+    outputFacialTransformationMatrixes: true,
     minFaceDetectionConfidence: q.get("lmc") ? +q.get("lmc") : 0.5,
     minFacePresenceConfidence: q.get("lmc") ? +q.get("lmc") : 0.5,
   });
@@ -179,9 +180,32 @@ async function detectBoxes(minTile, id, onProgress) {
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 
+// ---------- glasses model ----------
+// Privacy: a pair of glasses must not encode the wearer's facial measurements.
+// So every face in a photo wears the SAME model (one template, sized so it
+// covers the most demanding face), lenses are always symmetric, and each pair
+// gets fresh crypto-random jitter in size / position / tilt. The drawn size is
+// therefore template x jitter x a coarse face scale — it cannot be inverted
+// back to eye spacing or eye width, and re-running gives a different result.
+const rand = () => crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32;
+const BASE = { tw: 1.0, th: 0.86, gap: 0.16, drop: 0.07 };   // in units of face scale (~ eye-to-eye distance)
+let template = null;
+
+function fitTemplate() {
+  const span = Math.max(0, ...glasses.map((g) => g.need?.span || 0));
+  const up = Math.max(0, ...glasses.map((g) => g.need?.up || 0));
+  const k = 1 + rand() * 0.08;
+  template = {
+    tw: Math.max(BASE.tw, span - BASE.gap / 2) * k,
+    th: Math.max(BASE.th, 2 * (up + BASE.drop)) * k,
+    gap: BASE.gap, drop: BASE.drop,
+  };
+}
+
+const jitter = () => ({ scale: 1 + rand() * 0.18, rot: (rand() - 0.5) * 0.07, dx: (rand() - 0.5) * 0.08, dy: (rand() - 0.5) * 0.08 });
+
 function glassesFromEyes(a, b, kind, box) {
-  const d = dist(a, b);
-  return { L: { ...a, w: d * 0.88 }, R: { ...b, w: d * 0.88 }, h: d * 0.64, drop: d * 0.06, temples: null, kind, box };
+  return { c: mid(a, b), ang: Math.atan2(b.y - a.y, b.x - a.x), s: dist(a, b), fx: 1, temples: null, need: null, j: jitter(), kind, box };
 }
 
 const cropCanvas = document.createElement("canvas");
@@ -194,27 +218,33 @@ function refine(box) {
   const ox = cx - side / 2, oy = cy - side / 2;
   cropCtx.fillStyle = "#000"; cropCtx.fillRect(0, 0, CROP, CROP);
   cropCtx.drawImage(source, ox, oy, side, side, 0, 0, CROP, CROP);
-  const faces = landmarker.detect(cropCanvas).faceLandmarks || [];
+  const res = landmarker.detect(cropCanvas);
+  const faces = res.faceLandmarks || [];
   const P = (lm, i) => ({ x: ox + lm[i].x * side, y: oy + lm[i].y * side });
   let best = null;
-  for (const lm of faces) {
+  faces.forEach((lm, i) => {
     const c = mid(mid(P(lm, 33), P(lm, 133)), mid(P(lm, 362), P(lm, 263)));
     const off = dist(c, { x: cx, y: cy });
-    if (c.x < box.x || c.x > box.x + box.w || c.y < box.y || c.y > box.y + box.h) continue;
-    if (!best || off < best.off) best = { lm, off };
-  }
+    if (c.x < box.x || c.x > box.x + box.w || c.y < box.y || c.y > box.y + box.h) return;
+    if (!best || off < best.off) best = { lm, off, m: res.facialTransformationMatrixes?.[i]?.data };
+  });
   if (!best) return null;
-  const lm = best.lm;
+  const { lm, m } = best;
   const eL = mid(P(lm, 33), P(lm, 133)), eR = mid(P(lm, 362), P(lm, 263));
-  const d = dist(eL, eR), faceH = dist(P(lm, 10), P(lm, 152));
-  // per-eye width follows each eye's apparent size, so the far lens shrinks when the head turns
-  let wL = dist(P(lm, 33), P(lm, 133)) * 2.0, wR = dist(P(lm, 362), P(lm, 263)) * 2.0;
-  const fit = (d * 0.94) / ((wL + wR) / 2);
-  if (fit < 1) { wL *= fit; wR *= fit; }
+  const ang = Math.atan2(eR.y - eL.y, eR.x - eL.x);
+  // head pose (not a biometric) tells how much horizontal / vertical extents are foreshortened
+  const fx = m ? Math.max(0.55, Math.hypot(m[0], m[1]) / Math.hypot(m[0], m[1], m[2])) : 1;
+  const fy = m ? Math.max(0.7, Math.hypot(m[4], m[5]) / Math.hypot(m[4], m[5], m[6])) : 1;
+  const scale = Math.max(dist(eL, eR) / fx, dist(P(lm, 10), P(lm, 152)) * 0.34 / fy);
+  const c = P(lm, 168);   // nose bridge between the eyes
+  const upOf = (p) => (p.x - c.x) * Math.sin(ang) - (p.y - c.y) * Math.cos(ang);
   return {
-    L: { ...eL, w: wL }, R: { ...eR, w: wR },
-    h: Math.max(faceH * 0.24, d * 0.5), drop: faceH * 0.035,
-    temples: [P(lm, 127), P(lm, 356)], kind: "mesh", box,
+    c, ang, s: scale, fx, temples: [P(lm, 127), P(lm, 356)], j: jitter(), kind: "mesh", box,
+    // what this face needs from the shared template: reach past the outer eye corners, and above the brows
+    need: {
+      span: Math.max(dist(c, P(lm, 33)), dist(c, P(lm, 263))) / (scale * fx) + 0.3,
+      up: Math.max(upOf(P(lm, 105)), upOf(P(lm, 334))) / scale + 0.08,
+    },
   };
 }
 
@@ -235,6 +265,7 @@ async function run() {
       (box.score >= FALLBACK_SCORE ? glassesFromEyes(box.eyes[0], box.eyes[1], "eyes", box) : null);
     if (g) glasses.push(g);
   }
+  fitTemplate();
   const ms = Math.round(performance.now() - t0);
   busy = false; updateButtons(); render();
   const fb = glasses.filter((g) => g.kind === "eyes").length;
@@ -251,29 +282,34 @@ function lensPath(ctx, w, h) {
   ctx.roundRect(-w / 2, -h / 2, w, h, [h * 0.22, h * 0.22, h * 0.45, h * 0.45]);
 }
 
+function metrics(g) {
+  const S = g.s * g.j.scale;
+  return { S, w: S * template.tw * g.fx, h: S * template.th, gap: S * template.gap * g.fx, drop: S * template.drop };
+}
+
 function drawGlasses(ctx, g) {
-  const ang = Math.atan2(g.R.y - g.L.y, g.R.x - g.L.x);
-  const c = mid(g.L, g.R), d = dist(g.L, g.R), h = g.h;
+  const { S, w, h, gap, drop } = metrics(g);
+  const ang = g.ang + g.j.rot, c = { x: g.c.x + g.j.dx * S, y: g.c.y + g.j.dy * S };
   ctx.save();
-  ctx.translate(c.x, c.y); ctx.rotate(ang); ctx.translate(0, g.drop);
-  const lx = -d / 2, rx = d / 2, frame = Math.max(1.5, h * 0.09);
+  ctx.translate(c.x, c.y); ctx.rotate(ang); ctx.translate(0, drop);
+  const lx = -(gap + w) / 2, rx = (gap + w) / 2, frame = Math.max(1.5, h * 0.07);
   ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#0a0a0a";
 
   if (g.temples) {
     // temples run from each lens' outer top corner to the side of the head
-    const inv = (p) => { const x = p.x - c.x, y = p.y - c.y, cs = Math.cos(-ang), sn = Math.sin(-ang); return { x: x * cs - y * sn, y: x * sn + y * cs - g.drop }; };
+    const inv = (p) => { const x = p.x - c.x, y = p.y - c.y, cs = Math.cos(-ang), sn = Math.sin(-ang); return { x: x * cs - y * sn, y: x * sn + y * cs - drop }; };
     const tl = inv(g.temples[0]), tr = inv(g.temples[1]);
     ctx.lineWidth = frame * 1.3;
     ctx.beginPath();
-    if (tl.x < lx - g.L.w / 2) { ctx.moveTo(lx - g.L.w / 2, -h * 0.28); ctx.lineTo(tl.x, -h * 0.2); }
-    if (tr.x > rx + g.R.w / 2) { ctx.moveTo(rx + g.R.w / 2, -h * 0.28); ctx.lineTo(tr.x, -h * 0.2); }
+    if (tl.x < lx - w / 2) { ctx.moveTo(lx - w / 2, -h * 0.28); ctx.lineTo(tl.x, -h * 0.2); }
+    if (tr.x > rx + w / 2) { ctx.moveTo(rx + w / 2, -h * 0.28); ctx.lineTo(tr.x, -h * 0.2); }
     ctx.stroke();
   }
 
   ctx.lineWidth = frame * 1.6;
-  ctx.beginPath(); ctx.moveTo(lx + g.L.w / 2, -h * 0.26); ctx.lineTo(rx - g.R.w / 2, -h * 0.26); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(lx + w / 2, -h * 0.26); ctx.lineTo(rx - w / 2, -h * 0.26); ctx.stroke();
 
-  for (const [x, w] of [[lx, g.L.w], [rx, g.R.w]]) {
+  for (const x of [lx, rx]) {
     ctx.save(); ctx.translate(x, 0);
     const grad = ctx.createLinearGradient(0, -h / 2, 0, h / 2);
     grad.addColorStop(0, "#262626"); grad.addColorStop(1, "#000");
@@ -351,8 +387,8 @@ const toImage = (e) => {
 };
 function hit(p) {
   for (let i = glasses.length - 1; i >= 0; i--) {
-    const g = glasses[i], c = mid(g.L, g.R);
-    if (dist(p, c) < dist(g.L, g.R) / 2 + Math.max(g.L.w, g.R.w) / 2) return i;
+    const g = glasses[i], m = metrics(g);
+    if (dist(p, g.c) < m.gap / 2 + m.w) return i;
   }
   return -1;
 }
