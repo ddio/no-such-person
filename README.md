@@ -34,6 +34,8 @@ python3 -m http.server 8931
 
 `test-photos/` 是 Wikimedia Commons 的公有領域照片，出處見該目錄的 README。
 
+社群分享圖 `og.jpg` 用的是 Giampietrino 約 1520 年臨摹的《最後的晚餐》（[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Giampietrino-Last-Supper-ca-1520.jpg)，公有領域）：達文西的原作剝落太嚴重，偵測只抓得到一兩張臉；摹本自動抓到 11 張，其餘 2 張側臉手動補上。
+
 ## 已知限制
 
 - 動物頭擋得住人臉辨識，但擋不住情境：衣著、體型、場景、同框的人，仍可能讓認識的人認出來。
