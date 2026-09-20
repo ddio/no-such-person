@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <!-- Scripts, workers and every fetch/XHR/WebSocket/beacon target must be same-origin, so photo data has no way out.
-     The single exception is an <img> ping to GoatCounter (anonymous page-view count, see bottom of file). -->
+     The single exception is an <img> ping to GoatCounter (anonymous page-view count, see the end of app.js). -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self'; img-src 'self' blob: data: https://no-such-person.goatcounter.com; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>查無此人 — 自動墨鏡 prototype</title>
@@ -98,7 +98,5 @@
 </main>
 
 <script type="module" src="app.js"></script>
-<!-- Anonymous page-view counter. count.js is self-hosted; CSP blocks its sendBeacon, so it falls back to an <img> ping. -->
-<script data-goatcounter="https://no-such-person.goatcounter.com/count" data-goatcounter-settings='{"path": "/"}' async src="vendor/goatcounter/count.js"></script>
 </body>
 </html>

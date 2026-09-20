@@ -256,3 +256,18 @@ $("saveJpg").addEventListener("click", () => save("image/jpeg", "jpg"));
 if (q.get("depth")) document.querySelector(`[name=depth][value="${q.get("depth")}"]`).checked = true;
 if (q.get("debug")) $("debug").checked = true;
 if (q.get("img")) fetch(q.get("img")).then((r) => r.blob()).then((b) => loadBlob(b, q.get("img").split("/").pop()));
+
+// ---------- anonymous page-view count (GoatCounter) ----------
+// One <img> ping per visit: path, referrer and screen size — no cookies, nothing about photos.
+// Hand-rolled instead of GoatCounter's count.js, which prefers sendBeacon: CSP (connect-src 'self')
+// blocks that silently, so count.js would believe it had counted. <img> is the only whitelisted way out.
+function countVisit() {
+  if (/^(localhost|127\.|\[::1\])/.test(location.host) || navigator.webdriver) return;
+  const p = new URLSearchParams({ p: "/", r: document.referrer, s: `${screen.width},${screen.height},${devicePixelRatio || 1}`, rnd: Math.random().toString(36).slice(2) });
+  new Image().src = `https://no-such-person.goatcounter.com/count?${p}`;
+}
+if (document.visibilityState === "visible") countVisit();
+else document.addEventListener("visibilitychange", function once() {
+  if (document.visibilityState !== "visible") return;
+  document.removeEventListener("visibilitychange", once); countVisit();
+});
