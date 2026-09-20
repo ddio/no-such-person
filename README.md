@@ -1,15 +1,17 @@
 # 查無此人 no-such-person
 
-自動找出照片裡的人臉並戴上墨鏡的純前端小工具。所有運算都在瀏覽器裡完成，照片不會上傳到任何伺服器。
+自動找出照片裡的每張臉、蓋上動物頭（或戴上墨鏡）的純前端小工具。所有運算都在瀏覽器裡完成，照片不會上傳到任何伺服器。
 
 👉 https://no-such-person.ddio.io
 
 ## 作法
 
 - **偵測**：把照片切成多種尺度、互相重疊的方塊，逐塊用 MediaPipe BlazeFace 偵測，合併後再對每張臉裁切放大跑 Face Landmarker 定位。大合照裡的小臉也抓得到。
-- **墨鏡**：整張照片共用同一個款式、左右對稱，每副再加上 `crypto.getRandomValues` 的大小／位置／傾斜擾動，避免從墨鏡的尺寸回推個人臉部特徵。
+- **動物頭（預設）**：不透明的 [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) 動物臉蓋住整顆頭，被蓋掉的像素無法還原；側臉會依頭部轉角往後腦位移。動物隨機發放，不依臉的特徵挑選。
+- **墨鏡**：只是好玩。研究顯示只遮眼睛時，人臉辨識系統仍有 99% 以上認得出來（[Impact of Sunglasses on One-to-Many Facial Identification Accuracy](https://arxiv.org/abs/2412.05721)），熟人也幾乎不受影響（[Noyes et al. 2021](https://pmc.ncbi.nlm.nih.gov/articles/PMC8074904/)）。
+- **不洩漏臉部量測**：遮蔽物的大小只取決於粗略的臉部尺度 × 整張照片共用的常數 × `crypto.getRandomValues` 的隨機擾動（大小／位置／傾斜），無法從成品回推眼距等個人特徵。
 - **匯出**：Canvas 重新編碼，不含原圖的 EXIF／GPS。
-- **手動修正**：點墨鏡可移除；從一隻眼睛拖曳到另一隻可手動加；勾「顯示候選框」後點紅框可補戴。
+- **手動修正**：點動物頭換一隻；右鍵（手機長按）移除；從一隻眼睛拖曳到另一隻可手動加；勾「顯示候選框」後點紅框可補上。
 
 ## 隱私設計
 
@@ -34,9 +36,9 @@ python3 -m http.server 8931
 
 ## 已知限制
 
-- 墨鏡對人眼有遮蔽效果，但不保證能擋下機器人臉辨識。
+- 動物頭擋得住人臉辨識，但擋不住情境：衣著、體型、場景、同框的人，仍可能讓認識的人認出來。
 - 被照片邊緣切掉的臉、嚴重遮擋的臉可能漏抓，請手動補上。
 
 ## 授權
 
-[MIT](LICENSE)。`vendor/` 內的 MediaPipe 程式與模型為 Google 所有，採 Apache License 2.0，見 [`vendor/README.md`](vendor/README.md)。
+[MIT](LICENSE)。`vendor/` 內的 MediaPipe 程式與模型為 Google 所有，採 Apache License 2.0，見 [`vendor/README.md`](vendor/README.md)；`stickers/` 的動物臉來自 Microsoft Fluent Emoji（MIT），見 [`stickers/README.md`](stickers/README.md)。

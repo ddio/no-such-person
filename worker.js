@@ -6,7 +6,8 @@
 // out: {type:"ready", delegate} | {type:"error", message}
 //      {type:"progress", id, p} | {type:"result", id, boxes, faces, ms}
 //      {type:"refined", id, face}
-// A "face" is glasses geometry without any randomness: {c, ang, s, fx, temples, need, kind, boxIndex}.
+// A "face" is cover geometry without any randomness: {c, ang, s, fx, back, temples, need, kind, boxIndex}
+// (back: how far the head's centre is from c along the eye axis, in units of s — non-zero for turned heads).
 
 // Started from a blob: URL (see app.js) so that it inherits the page's CSP — a worker loaded
 // straight from its URL would not, and could talk to any server. app.js prepends self.VENDOR.
@@ -141,9 +142,13 @@ function refine(box) {
   const fy = m ? Math.max(0.7, Math.hypot(m[4], m[5]) / Math.hypot(m[4], m[5], m[6])) : 1;
   const scale = Math.max(dist(eL, eR) / fx, dist(P(lm, 10), P(lm, 152)) * 0.34 / fy);
   const c = P(lm, 168);   // nose bridge between the eyes
+  // A turned head's centre sits behind the nose bridge. How far comes from pose alone (sin of the yaw);
+  // the nose tip only tells which way the face points.
+  const sinYaw = m ? Math.sqrt(Math.max(0, 1 - (m[0] ** 2 + m[1] ** 2) / (m[0] ** 2 + m[1] ** 2 + m[2] ** 2))) : 0;
+  const nose = P(lm, 1), facing = Math.sign((nose.x - c.x) * Math.cos(ang) + (nose.y - c.y) * Math.sin(ang));
   const upOf = (p) => (p.x - c.x) * Math.sin(ang) - (p.y - c.y) * Math.cos(ang);
   return {
-    c, ang, s: scale, fx, temples: [P(lm, 127), P(lm, 356)], kind: "mesh",
+    c, ang, s: scale, fx, back: -facing * sinYaw * 1.1, temples: [P(lm, 127), P(lm, 356)], kind: "mesh",
     // what this face needs from the shared template: reach just past the outer eye corners, and over most of the brows
     // (strongly turned heads are skipped: their far-side landmarks are guesses)
     need: fx < 0.8 ? null : {

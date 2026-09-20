@@ -27,7 +27,7 @@ function setVeil(p, text) {
 // The worker is started from a blob: URL because only then does it inherit this page's CSP
 // (connect-src 'self'); a worker loaded by URL is governed by its own response headers instead,
 // which a static host can't set. Verified: a URL worker can fetch cross-origin, a blob worker can't.
-const workerSrc = `self.VENDOR = ${JSON.stringify(new URL("vendor/", location.href).href)};\n` + await (await fetch("worker.js")).text();
+const workerSrc = `self.VENDOR = ${JSON.stringify(new URL("vendor/", location.href).href)};\n` + await (await fetch("worker.js", { cache: "no-cache" })).text();
 const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: "text/javascript" })));
 const pending = new Map();      // request id -> resolve, for "result" / "refined" replies
 let reqId = 0;
@@ -72,9 +72,57 @@ function fitTemplate() {
 
 const jitter = () => ({ scale: 1 + rand() * 0.18, rot: (rand() - 0.5) * 0.07, dx: (rand() - 0.5) * 0.08, dy: (rand() - 0.5) * 0.08 });
 
-const withJitter = (face, box) => ({ ...face, j: jitter(), box });
+const withJitter = (face, box) => ({ ...face, j: jitter(), box, sticker: nextSticker() });
 const glassesFromEyes = (a, b) =>
   withJitter({ c: mid(a, b), ang: Math.atan2(b.y - a.y, b.x - a.x), s: dist(a, b), fx: 1, temples: null, need: null, kind: "manual" }, null);
+
+// ---------- stickers (the default, and the mode that actually protects) ----------
+// An opaque animal head over the whole head. Same privacy rules as the glasses: size comes from
+// the coarse face scale x shared constants x random jitter, and the animal is dealt at random —
+// never chosen from anything about the face.
+const STICKERS = ["bear", "cat", "cow", "dog", "fox", "frog", "hamster", "koala", "lion", "monkey", "mouse", "panda", "pig", "polar-bear", "rabbit", "tiger"];
+const HEAD = { w: 3.0, h: 3.6, drop: 0.15 };   // head size to cover, in units of face scale; centre sits a bit below the eye line
+let mode = "sticker";
+
+// Each sticker's solid face blob (as fractions of the image), so ears and whiskers don't count as cover.
+function faceBlob(img) {
+  const n = 96, c = document.createElement("canvas"); c.width = c.height = n;
+  const x = c.getContext("2d", { willReadFrequently: true }); x.drawImage(img, 0, 0, n, n);
+  const a = x.getImageData(0, 0, n, n).data, solid = (px, py) => a[(py * n + px) * 4 + 3] > 200;
+  let sx = 0, sy = 0, m = 0;
+  for (let py = 0; py < n; py++) for (let px = 0; px < n; px++) if (solid(px, py)) { sx += px; sy += py; m++; }
+  const cx = Math.round(sx / m), cy = Math.round(sy / m);
+  let l = cx, r = cx, t = cy, b = cy;
+  while (l > 0 && solid(l - 1, cy)) l--; while (r < n - 1 && solid(r + 1, cy)) r++;
+  while (t > 0 && solid(cx, t - 1)) t--; while (b < n - 1 && solid(cx, b + 1)) b++;
+  return { cx: (l + r + 1) / 2 / n, cy: (t + b + 1) / 2 / n, w: (r - l + 1) / n, h: (b - t + 1) / n };
+}
+
+const stickers = await Promise.all(STICKERS.map(async (name) => {
+  const img = new Image(); img.src = `stickers/${name}.svg`; await img.decode();
+  return { img, blob: faceBlob(img) };
+}));
+
+let bag = [];                   // shuffle bag: everyone gets a different animal until all are used
+function nextSticker() {
+  if (!bag.length) bag = stickers.map((_, i) => i).sort(() => rand() - 0.5);
+  return bag.pop();
+}
+
+function stickerMetrics(g) {
+  const S = g.s * g.j.scale, { blob } = stickers[g.sticker];
+  // scale the image until its solid blob spans the head box (0.9: the blob is rounder than a box)
+  const size = Math.max(HEAD.w * S / blob.w, HEAD.h * S / blob.h) * 0.9;
+  return { S, size, blob };
+}
+
+function drawSticker(ctx, g) {
+  const { S, size, blob } = stickerMetrics(g);
+  ctx.save();
+  ctx.translate(g.c.x + g.j.dx * S, g.c.y + g.j.dy * S); ctx.rotate(g.ang + g.j.rot); ctx.translate((g.back || 0) * S, HEAD.drop * S);
+  ctx.drawImage(stickers[g.sticker].img, -blob.cx * size, -blob.cy * size, size, size);
+  ctx.restore();
+}
 
 async function run() {
   if (!source) return;
@@ -95,7 +143,7 @@ async function run() {
   fitTemplate();
   busy = false; updateButtons(); render(); veil.hidden = true;
   const fb = glasses.filter((g) => g.kind === "eyes").length;
-  setStatus(`找到 <b>${glasses.length}</b> 張臉${fb ? `（其中 ${fb} 張為粗略定位）` : ""}，耗時 ${(res.ms / 1000).toFixed(1)} 秒。有漏掉的請手動拖曳補上。`);
+  setStatus(`找到 <b>${glasses.length}</b> 張臉${fb ? `（其中 ${fb} 張為粗略定位）` : ""}，耗時 ${(res.ms / 1000).toFixed(1)} 秒。有漏掉的請手動補上。`);
   window.__result = {
     template, faces: glasses.length, fallback: fb, candidates: rawBoxes.length, ms: res.ms,
     boxes: rawBoxes.map((b) => ({ x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.w), score: +b.score.toFixed(2), kind: glasses.find((g) => g.box === b)?.kind || "dropped" })),
@@ -152,7 +200,8 @@ function drawGlasses(ctx, g) {
 
 function paint(ctx, debug) {
   ctx.drawImage(source, 0, 0);
-  for (const g of glasses) drawGlasses(ctx, g);
+  // bigger (nearer) faces last, so their cover sits on top of the people behind them
+  for (const g of [...glasses].sort((a, b) => a.s - b.s)) (mode === "sticker" ? drawSticker : drawGlasses)(ctx, g);
   if (debug) {
     ctx.lineWidth = Math.max(2, source.width / 600);
     for (const g of glasses) if (g.box) {
@@ -198,6 +247,7 @@ addEventListener("paste", (e) => {
   if (f) { e.preventDefault(); loadBlob(f, f.name && f.name !== "image.png" ? f.name : "pasted"); }
 });
 $("debug").addEventListener("change", () => render());
+for (const r of document.querySelectorAll("[name=mode]")) r.addEventListener("change", () => { mode = r.value; render(); });
 for (const ev of ["dragenter", "dragover"]) stage.addEventListener(ev, (e) => { e.preventDefault(); stage.classList.add("drag"); });
 for (const ev of ["dragleave", "drop"]) stage.addEventListener(ev, (e) => { e.preventDefault(); stage.classList.remove("drag"); });
 stage.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) loadBlob(f, f.name); });
@@ -208,21 +258,39 @@ const toImage = (e) => {
 };
 function hit(p) {
   for (let i = glasses.length - 1; i >= 0; i--) {
-    const g = glasses[i], m = metrics(g);
-    if (dist(p, g.c) < m.gap / 2 + m.w) return i;
+    const g = glasses[i];
+    const r = mode === "sticker" ? stickerMetrics(g).S * HEAD.w / 2 : metrics(g).gap / 2 + metrics(g).w;
+    if (dist(p, g.c) < r) return i;
   }
   return -1;
 }
-let drag = null;
-view.addEventListener("pointerdown", (e) => { if (busy) return; view.setPointerCapture(e.pointerId); drag = { a: toImage(e), b: toImage(e) }; });
-view.addEventListener("pointermove", (e) => { if (drag) { drag.b = toImage(e); render(drag); } });
+const coverStatus = () => setStatus(`目前遮了 <b>${glasses.length}</b> 張臉。`);
+function removeAt(p) {
+  const i = hit(p);
+  if (i < 0) return false;
+  glasses.splice(i, 1); render(); coverStatus();
+  return true;
+}
+let drag = null, holdTimer = 0;
+const movedPx = (d) => dist(d.a, d.b) * view.getBoundingClientRect().width / view.width;
+view.addEventListener("pointerdown", (e) => {
+  if (busy || e.button !== 0) return;
+  view.setPointerCapture(e.pointerId);
+  drag = { a: toImage(e), b: toImage(e) };
+  // long-press = remove (the touch equivalent of right-click)
+  clearTimeout(holdTimer);
+  holdTimer = setTimeout(() => { if (drag && movedPx(drag) < 8 && removeAt(drag.a)) drag = null; }, 600);
+});
+view.addEventListener("contextmenu", (e) => { e.preventDefault(); if (!busy) removeAt(toImage(e)); });
+view.addEventListener("pointermove", (e) => { if (drag) { drag.b = toImage(e); if (movedPx(drag) >= 8) render(drag); } });
 view.addEventListener("pointerup", async () => {
+  clearTimeout(holdTimer);
   if (!drag) return;
-  const { a, b } = drag; drag = null;
-  const moved = dist(a, b) * view.getBoundingClientRect().width / view.width;
+  const { a, b } = drag, moved = movedPx(drag); drag = null;
   if (moved < 8) {
     const i = hit(a);
-    if (i >= 0) glasses.splice(i, 1);
+    // click: next animal in sticker mode, remove in glasses mode (right-click / long-press removes in both)
+    if (i >= 0) { if (mode === "sticker") glasses[i].sticker = (glasses[i].sticker + 1) % stickers.length; else glasses.splice(i, 1); }
     else if ($("debug").checked) {
       // promote a skipped candidate
       const box = rawBoxes.find((b) => !glasses.some((g) => g.box === b) && a.x >= b.x && a.x <= b.x + b.w && a.y >= b.y && a.y <= b.y + b.h);
@@ -233,10 +301,9 @@ view.addEventListener("pointerup", async () => {
     }
   }
   else { const [l, r] = a.x <= b.x ? [a, b] : [b, a]; glasses.push(glassesFromEyes(l, r)); }
-  render();
-  setStatus(`目前有 <b>${glasses.length}</b> 副墨鏡。`);
+  render(); coverStatus();
 });
-view.addEventListener("pointercancel", () => { drag = null; render(); });
+view.addEventListener("pointercancel", () => { clearTimeout(holdTimer); drag = null; render(); });
 
 // ---------- export ----------
 function save(type, ext) {
@@ -245,14 +312,15 @@ function save(type, ext) {
   paint(out.getContext("2d"), false);
   out.toBlob((blob) => {
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob); a.download = `${fileName}-sunglasses.${ext}`; a.click();
+    a.href = URL.createObjectURL(blob); a.download = `${fileName}-anon.${ext}`; a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }, type, 0.92);
 }
 $("savePng").addEventListener("click", () => save("image/png", "png"));
 $("saveJpg").addEventListener("click", () => save("image/jpeg", "jpg"));
 
-// dev helper: ?img=test-photos/obama.jpg[&depth=96][&debug=1]
+// dev helper: ?img=test-photos/obama.jpg[&depth=96][&debug=1][&mode=glasses]
+if (q.get("mode")) { mode = q.get("mode"); document.querySelector(`[name=mode][value="${mode}"]`).checked = true; }
 if (q.get("depth")) document.querySelector(`[name=depth][value="${q.get("depth")}"]`).checked = true;
 if (q.get("debug")) $("debug").checked = true;
 if (q.get("img")) fetch(q.get("img")).then((r) => r.blob()).then((b) => loadBlob(b, q.get("img").split("/").pop()));
