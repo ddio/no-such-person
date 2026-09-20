@@ -2,8 +2,9 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<!-- Nothing can leave this page: every fetch/XHR/WebSocket target, script, worker and image must be same-origin. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self'; img-src 'self' blob: data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<!-- Scripts, workers and every fetch/XHR/WebSocket/beacon target must be same-origin, so photo data has no way out.
+     The single exception is an <img> ping to GoatCounter (anonymous page-view count, see bottom of file). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self'; img-src 'self' blob: data: https://no-such-person.goatcounter.com; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>查無此人 — 自動墨鏡 prototype</title>
 <style>
@@ -88,7 +89,8 @@
   </div>
   <footer>
     點一下墨鏡可移除；勾選「顯示候選框」後點紅框可補戴；在漏掉的臉上從一隻眼睛拖曳到另一隻眼睛可手動加上墨鏡。匯出的圖檔會重新編碼，不含原圖的 EXIF／GPS 資訊。<br>
-    模型與程式全部由本站提供，頁面以 CSP 禁止任何對外連線——可以打開開發者工具的 Network 分頁，或直接離線使用來驗證。<br>
+    模型與程式全部由本站提供，頁面以 CSP 禁止程式對外傳送資料——可以打開開發者工具的 Network 分頁，或直接離線使用來驗證。
+    唯一的對外連線是 <a href="https://www.goatcounter.com" target="_blank" rel="noopener">GoatCounter</a> 的匿名瀏覽計數（無 cookie、不含任何照片資訊）。<br>
     <a href="https://github.com/ddio/no-such-person" target="_blank" rel="noopener">GitHub 原始碼</a> ·
     <a href="https://github.com/ddio/no-such-person/issues" target="_blank" rel="noopener">回報問題／許願</a> ·
     MIT License
@@ -96,5 +98,7 @@
 </main>
 
 <script type="module" src="app.js"></script>
+<!-- Anonymous page-view counter. count.js is self-hosted; CSP blocks its sendBeacon, so it falls back to an <img> ping. -->
+<script data-goatcounter="https://no-such-person.goatcounter.com/count" data-goatcounter-settings='{"path": "/"}' async src="vendor/goatcounter/count.js"></script>
 </body>
 </html>

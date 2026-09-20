@@ -13,10 +13,12 @@
 
 ## 隱私設計
 
-- 模型、WASM、程式全部由本站提供（`vendor/`），執行時不連任何第三方。
+- 模型、WASM、程式全部由本站提供（`vendor/`），處理照片時不連任何第三方。
 - 頁面的 CSP 設為 `default-src 'none'; connect-src 'self'`，瀏覽器層級禁止對外連線。
 - 偵測跑在 Web Worker 裡。Worker 刻意從 `blob:` URL 啟動：這樣它才會繼承頁面的 CSP；
   直接用網址載入的 Worker 只受自己的 HTTP 回應標頭約束，而靜態主機（GitHub Pages）無法設定標頭。
+- 唯一的例外：頁面載入時對 [GoatCounter](https://www.goatcounter.com) 發一個匿名瀏覽計數（`img-src` 白名單，無 cookie）。
+  `connect-src` 仍是 `'self'`，所以處理照片的程式與 Worker 沒有任何對外管道。
 - 想自己驗證：打開開發者工具的 Network 分頁，或載入頁面後斷網使用。
 
 ## 開發
